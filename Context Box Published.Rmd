@@ -1,0 +1,839 @@
+---
+title: "Context Box"
+author: "For ISO Code reference: https://www.iban.com/country-codes"
+date: ''
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE, echo=FALSE, cache=TRUE}
+knitr::opts_chunk$set(echo = FALSE)
+##Context Box RMD v7.0
+##last edited 11/03/22 by Jack French and Anmol Makhija
+library(tidyverse)
+library(rlist)
+library(tidyquant)
+library(shiny)
+library(data.table)
+library(WDI)
+library(flextable)
+library(priceR)
+library(RCurl)
+library(countrycode)
+library(downloadthis)
+
+##-----------parameters---------------------------------------------------------
+gdpCode                   = "NY.GDP.MKTP.CD"
+gdpPerCapCode             = "NY.GDP.PCAP.CD"
+sizeBankingPctGDPCode     = "GFDD.DI.02"
+fiveBankConcCode          = "GFDD.OI.06"
+forInvolveBankCode        = "GFDD.OI.16"
+govOwnershipOfBankSysCode = "GFDD.OI.20a"
+sizeNonBankFinPCTGDPCode  = "GFDD.DI.03"
+
+defaultCountry   = "US"
+defaultStartYear = floor_date(Sys.Date() - years(3), unit = "year")
+defaultEndYear   = Sys.Date() - years(2)
+
+##-----------functions----------------------------------------------------------
+##load data functions
+getWBData = function(code, country, startDate, endDate) {
+  rawWB = WDI(
+    country   = country,
+    indicator = code,
+    start     = year(startDate),
+    end       = year(endDate)) #WDI() is the basic function
+  
+  rawWB %>%
+    select(!iso2c) %>%
+    pivot_longer(!c(year, country), names_to = "symbol", values_to = "value") %>%
+    select(year, symbol, value) %>%
+    rename("date" = "year") %>%
+    mutate(date = as.Date(ISOdate(date, 1, 1))) #this outputs date, symbol, value. will be helpful if we ever add other data
+} #basic function to load and format WB data
+
+getDepositInsurance = function(countryCode, startDate, endDate) {
+  countryCode = as.character(countryCode)
+  startDate   = as.Date(startDate)
+  endDate     = as.Date(endDate)
+  startYear   = year(startDate)
+  endYear     = year(endDate)
+  #creates deposit insurance dataset then pulls out 1 or 0
+  #library(RCurl)
+  # library(tidyverse)
+  # library(countrycode)
+  ##--------define url-------
+  url  = list(
+    depositInsurance = "https://raw.githubusercontent.com/ypfs/Context-Box/main/DepositInsuranceExistence.csv"
+  )
+  ##--------get and clean data frame from github-------
+  x    = getURL(url$depositInsurance)
+  data = as.data.frame(read.csv(text = x, header = TRUE))
+  #add iso 2 codes to be compatible with world bank
+  names(data) = c("countryName", "isoCode3", "inceptionDate")
+
+  cleanIso = data %>%
+    mutate(isoCode = countrycodeNoWarning(countryName, origin = "country.name", destination = "iso2c"))
+  
+  ##--------create empty data frame--------------------
+  dateDataFrame = as.data.frame(seq(startDate, endDate, by = "year"))
+  names(dateDataFrame)[1] = "date"
+  
+  #adding symbol
+  dateAndSymbol = dateDataFrame %>%
+    mutate(symbol = "Existence of Deposit Insurance")
+  
+  
+  ##--------extract 1 or 0------------------------------
+  
+  existenceOfDepositInsurance = dateAndSymbol %>% 
+    group_by(date) %>%
+    mutate(
+      value = if (countryCode %in% cleanIso$isoCode) { #if 'code' input from concept list matches something in code map,
+    yearToUse = filter(cleanIso, isoCode == countryCode)
+      
+    if_else(yearToUse$inceptionDate <= year(date), 1, 0)  # return the value associated with it
+  } else {
+    0 #else just use the code from the concept list. this allows you to enter "CPI" or something like "IMF/CPI/M.USA.PCPI_IX"
+  }
+    ) %>%
+    ungroup()
+  
+  existenceOfDepositInsurance
+}
+
+getData = function(concepts) {
+  code       = concepts$code #grabbing inputs
+  country    = concepts$country
+  startDate  = concepts$startDate
+  endDate    = concepts$endDate
+  name       = concepts$name
+  formatType = concepts$formatType
+  
+  wbDataExceptionsList = list(
+    "depositInsurance" = getDepositInsurance(country, startDate, endDate)
+    ) #most things come from world bank api
+  #a few don't and need to be redirected
+  
+  data = if (code %in% names(wbDataExceptionsList)) {
+    wbDataExceptionsList[[code]]
+  } else {
+    getWBData(code, country, startDate, endDate)
+  }
+  
+  namedData = data %>%
+    mutate(symbol = name) %>% 
+    setorder(date)
+  
+  formattedOutput = namedData %>%
+    rowwise() %>%
+    mutate(
+      formattedValue = formatValueMap(value, formatType),
+      formattedValue = if_else(is.na(formattedValue), "Data not available", as.character(formattedValue), "Data not available"),
+      valueAndDate   = str_glue("{formattedValue} in {year(date)}")
+    ) %>%
+    select(symbol, valueAndDate)
+  
+  append(list(
+    "data"            = namedData,
+    "formattedOutput" = formattedOutput
+    ), concepts) #tacks data onto the list.
+  #this will be helpful when it's formatting time
+    
+}
+
+getCreditRatings = function(concepts) {
+  code         = as.character(concepts$code)
+  countryCode  = as.character(concepts$country)
+  startDate    = as.Date(concepts$startDate)
+  endDate      = as.Date(concepts$endDate)
+  
+  startYear    = floor_date(startDate, unit = "year")
+  endYear      = ceiling_date(endDate, unit = "year") - days(1)
+  
+  defaultW <- getOption("warn") 
+  options(warn = -1) 
+  countryToUse = as.character(countrycodeNoWarning(countryCode, origin = "iso2c", destination = "country.name")) #we know this generates warnings. 
+  options(warn = defaultW) #suppressing to speed up loading and then turning back on
+  ##--------load data-------
+  
+  ratingsMap = list(
+    "Moody’s" = "https://raw.githubusercontent.com/ypfs/Context-Box/main/moodysCreditRatings.csv",
+    "S&P"     = "https://raw.githubusercontent.com/ypfs/Context-Box/main/spCreditRatings.csv",
+    "Fitch"  = "https://raw.githubusercontent.com/ypfs/Context-Box/main/fitchCreditRatings.csv"
+  )
+  ##--------get and clean data frame from github-------
+  urlToUse = ratingsMap[[code]]
+  
+  githubCreditRatings = as.data.frame(read_csv(urlToUse, show_col_types = FALSE)) %>%
+    rename("date" = "Date") %>%
+    mutate(date = as.Date(floor_date(mdy(date), unit = "year")))
+  
+  ##--------create empty data frame--------------------
+  dateDataFrame = as.data.frame(seq(startYear, endYear, by = "year"))
+  names(dateDataFrame)[1] = "date"
+  ##--------extract rating------------------------------
+  
+  creditRating = if (countryToUse %in% names(githubCreditRatings) && startYear >= min(githubCreditRatings$date)) {
+  githubCreditRatings %>%
+    select(date, all_of(countryToUse)) %>%
+    filter(date >= startYear,
+           date <= endYear)
+  } else { #error catcher for when country name doesn't exist
+    dateDataFrame %>%
+      mutate(countryToUse = "Data not available")
+  }
+  
+  creditRating %>%
+    mutate(symbol = as.character(code)) %>%
+    rename(value = countryToUse) %>%
+    select(date, symbol, value) %>%
+    mutate(value = if_else(value == "#N/A Invalid Security", "Data not available", value, "Data not available"),
+           value = if_else(value == "#N/A N/A", "Data not available", value, "Data not available"))
+}
+
+countryOptions = function() {
+  allCountries = WDI(country = "all", 
+                     indicator = "NY.GDP.MKTP.CD", 
+                     start = "2020", 
+                     end = "2020")
+  
+  select(allCountries, country, iso2c)
+} #this just produces a vector of country names. will be easy to plug into
+
+countrycodeNoWarning = function(input, origin, destination) {
+  defaultW <- getOption("warn") 
+  options(warn = -1) 
+  code = countrycode(input, origin = origin, destination = destination)
+  options(warn = defaultW)
+  code
+}
+
+##logic functions
+createEmptyTable = function(concepts) {
+  name      = concepts$name
+  startDate = concepts$startDate
+  endDate   = concepts$endDate
+  
+  dateDataFrame = as.data.frame(seq(startDate, endDate, by = "year"))
+  names(dateDataFrame)[1] = "date"
+  
+  tidyData = dateDataFrame %>%
+    mutate(symbol = name,
+           value  = NA) 
+  
+  formattedData = tidyData %>%
+    rowwise() %>%
+    mutate(value = if_else(is.na(value), "Data not available", as.character(value), "Data not available"),
+           valueAndDate = str_glue("{value} in {year(date)}")
+    ) %>%
+    select(symbol, valueAndDate)
+}
+
+countryLookup = function(countryName) {
+  countryOptionTable = countryOptions()
+  
+  if (countryName %in% countryOptionTable$country) {
+    filteredTable = countryOptionTable %>%
+      filter(country == countryName)
+    filteredTable$iso2c
+  } else {
+    countryName
+  }
+}
+
+countryReverseLookup = function(countryIsoCode) {
+  countryOptionTable = countryOptions()
+  
+  if (countryIsoCode %in% countryOptionTable$iso2c) {
+    filteredTable = countryOptionTable %>%
+      filter(iso2c == countryIsoCode)
+    filteredTable$country
+  } else {
+    countryIsoCode
+  }
+}
+
+##viz functions
+createFlexTable = function(tidyData) {
+  flextable(tidyData) %>%
+    merge_v("symbol") %>% #vertically merge cells in symbol column
+    delete_part() %>%
+    border_inner() %>%
+    border_outer() %>%
+    width(width = 4, unit = "in") %>%
+    height(height = .30, unit = "in") %>% 
+    align(align = "center") %>%
+    bold(j = "symbol", bold = TRUE) %>%
+    hrule(rule = "exact") %>%
+    font(fontname = "Serif Cambria")
+}
+
+formatValueMap = function(value, formatType) {
+  
+  if (value == "NA" || is.na(value)) {
+    "Data not available"
+  } else {
+  
+  if (formatType == "nominalGdp") {
+      if (value >= 1000000000000) {
+        as.character(str_glue("{format_dollars(value / 1000000000000, 1)} trillion"))
+    } else if (value < 1000000000000) {
+        as.character(str_glue("{format_dollars(value / 1000000000, 1)} billion"))
+      }
+  } else if (formatType == "nominalGdpPerCap") {
+        as.character(str_glue("{format_dollars(value, 0)}"))
+  } else if (formatType == "depositInsurance") {
+        if_else(value == 1, "Yes", "No", "Not Available")
+  } else if (formatType == "toPCT") {
+        as.character(str_glue("{round(value, 1)}%"))
+  } else {
+      value
+  }
+    
+  }
+}
+
+```
+
+```{r inputs, echo=FALSE, warning=FALSE, cache=TRUE}
+inputPanel(
+  selectInput(inputId = "countryCode",
+            label    = "Select Country", 
+            choices  = countryOptions(),
+            selected = defaultCountry),
+
+  dateInput("startDate", "From:", value = defaultStartYear, format = "yyyy", startview = "decade"),
+  dateInput("endDate", "To:", value     = defaultEndYear, format = "yyyy", startview = "decade")
+)
+
+```
+
+```{r TopBar, warning=FALSE}
+##this is just rendering the header
+renderUI({
+##-----------parameters---------------------------------------------------------
+countryName = input$countryCode
+startDate   = as.Date(input$startDate)
+endDate     = as.Date(input$endDate)
+
+##-----------load data----------------------------------------------------------
+countryNameToUse = countryReverseLookup(countryName)
+
+##-----------do logic-----------------------------------------------------------
+headerText = as.character(str_glue("Context: {countryNameToUse} {year(startDate)}–{year(endDate)}"))
+outputData = as.data.frame(headerText)
+
+##-----------viz----------------------------------------------------------------
+flextable(outputData) %>% #uses different formatting than the rest of the chunks
+    delete_part() %>%
+    border_inner() %>%
+    border_outer() %>%
+    width(width = 8.001, unit = "in") %>%
+    height(height = .15, unit = "in") %>% 
+    hrule(rule = "exact") %>%
+    align(align = "center") %>%
+    bg(bg = "lightgray") %>%
+    bold(j = "headerText", bold = TRUE) %>%
+    font(fontname = "Serif Cambria") %>%
+  htmltools_value()
+})
+
+```
+
+```{r GDP, warning=FALSE}
+renderUI({
+##-----------parameters---------------------------------------------------------
+countryName = input$countryCode
+startDate   = as.Date(input$startDate)
+endDate     = as.Date(input$endDate)
+
+countryToUse = as.character(countryLookup(countryName)) #switches to iso code for WDI loading
+
+concepts = list(
+  list(
+    code      = gdpCode,
+    country   = countryToUse,
+    startDate = startDate,
+    endDate   = endDate,
+    formatType = "nominalGdp",
+    name      = "GDP (SAAR, nominal GDP in LCU converted to USD)" #one day these names would live in a table on Github and autopopulate
+  )
+)
+conceptsToUse = list.filter(concepts, code != "") #to temporarily remove a concept just change code to ""
+
+finalTableOutput = tryCatch(
+  {
+##-----------load data----------------------------------------------------------
+dataList = Map(getData, conceptsToUse) #applies getData to each item in conceptsToUse
+##-----------do logic-----------------------------------------------------------
+outputData = Map(function(x) x$formattedOutput, dataList) %>%
+  rbindlist() #outputs the formatted data. good if straight data pull
+  },
+error = function(cond) { #error catching##if there's an error, do this
+  emptyTable = Map(createEmptyTable, conceptsToUse) %>%
+  rbindlist()
+    return(emptyTable)
+  }
+) # end of tryCatch
+##-----------viz----------------------------------------------------------------
+htmltools_value((createFlexTable(finalTableOutput))) %>%
+  div(style = "margin-top: -45px")
+})
+
+```
+
+```{r GDP Per Capita, echo=FALSE, warning=FALSE}
+##start of code chunks
+renderUI({
+##-----------parameters---------------------------------------------------------
+countryName = input$countryCode
+startDate   = as.Date(input$startDate)
+endDate     = as.Date(input$endDate)
+
+countryToUse = as.character(countryLookup(countryName))
+
+concepts = list(
+  list(
+    code       = gdpPerCapCode,
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate,
+    formatType = "nominalGdpPerCap",
+    name       = "GDP per capita (SAAR, nominal GDP in LCU converted to USD)" #one day these names would live in a table on Github and autopopulate
+  )
+)
+conceptsToUse = list.filter(concepts, code != "") #to temporarily remove a concept just change code to ""
+
+finalTableOutput = tryCatch(
+  {
+##-----------load data----------------------------------------------------------
+dataList = Map(getData, conceptsToUse) #applies getData to each item in conceptsToUse
+##-----------do logic-----------------------------------------------------------
+outputData = Map(function(x) x$formattedOutput, dataList) %>%
+  rbindlist() #outputs the formatted data. good if straight data pull
+  },
+error = function(cond) { #error catching##if there's an error, do this
+  emptyTable = Map(createEmptyTable, conceptsToUse) %>%
+  rbindlist()
+    return(emptyTable)
+  }
+) # end of tryCatch
+##-----------viz----------------------------------------------------------------
+htmltools_value((createFlexTable(finalTableOutput))) %>%
+  div(style = "margin-top: -45px")
+
+})
+```
+
+```{r CreditRatings, echo=FALSE, warning=FALSE}
+renderUI({
+##-----------parameters---------------------------------------------------------
+countryName = input$countryCode
+startDate   = as.Date(input$startDate)
+endDate     = as.Date(input$endDate)
+
+countryToUse = as.character(countryLookup(countryName))
+
+concepts = list(
+  list(
+    code       = "Moody’s",
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate
+  ),
+    list(
+    code       = "S&P",
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate
+  ),
+    list(
+    code       = "Fitch",
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate
+  )
+)
+conceptsToUse = list.filter(concepts, code != "") #to temporarily remove a concept just change code to ""
+
+##-----------load data----------------------------------------------------------
+dataList = Map(getCreditRatings, conceptsToUse) #applies getCreditRatings to each item in conceptsToUse
+
+##-----------do logic-----------------------------------------------------------
+tidyData = dataList %>%
+  rbindlist() %>%
+  setorder(date)
+
+outputTable = tidyData %>%
+  rowwise() %>%
+  mutate(
+    value  = as.character(str_glue("{symbol}: {value}")),
+    symbol = "Sovereign credit rating (five-year senior debt)",
+    date   = as.character(year(date))
+  ) %>%
+  ungroup() %>%
+  select(symbol, date, value)
+
+##-----------viz----------------------------------------------------------------
+outputFlexTable = flextable(outputTable) %>% #uses different formatting than the rest of the chunks
+    merge_v("symbol") %>% #vertically merge cells in symbol column
+    merge_v("date") %>%
+    delete_part() %>%
+    border_inner() %>%
+    border_outer() %>%
+    align(align = "center") %>%
+    width(j = "symbol", width = 3.50, unit = "in") %>%
+    width(j = "date", width = .495, unit = "in") %>%
+    width(j = "value", width = 3.991, unit = "in") %>%
+    height(height = .20, unit = "in") %>%
+    bold(j = "symbol", bold = TRUE) %>%
+    font(fontname = "Serif Cambria") %>%
+    hrule(rule = "exact")
+  
+htmltools_value(outputFlexTable) %>%
+  div(style = "margin-top: -45px")
+
+})
+```
+
+```{r SizeBankingUSDBLN, echo=FALSE, warning=FALSE}
+##calculated using banking sys % of GDP and GDP USD
+renderUI({
+##-----------parameters---------------------------------------------------------
+countryName = input$countryCode
+startDate   = as.Date(input$startDate)
+endDate     = as.Date(input$endDate)
+countryToUse = as.character(countryLookup(countryName))
+concepts = list(
+  list(
+    code       = sizeBankingPctGDPCode,
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate,
+    formatType = "toPCT",
+    name       = "sizeBankingPCTGDP" #one day these names would live in a table on Github and autopopulate
+  ),
+  list(
+    code       = gdpCode,
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate,
+    formatType = "nominalGDP",
+    name       = "gdpUSD" #one day these names would live in a table on Github and autopopulate
+  )
+)
+conceptsToUse = list.filter(concepts, code != "") #to temporarily remove a concept just change code to “”
+
+finalOutputTable = tryCatch(
+  {
+##-----------load data----------------------------------------------------------
+dataList = Map(getData, conceptsToUse) #applies getData to each item in conceptsToUse
+##-----------do logic-----------------------------------------------------------
+tidyData = Map(function(x) x$data, dataList) %>%
+  rbindlist()
+
+wideData = tidyData %>%
+  pivot_wider(names_from = symbol, values_from = value) %>%
+  mutate(sizeBankingPCTGDP = sizeBankingPCTGDP * .01) %>%
+  mutate("Size of banking system" = sizeBankingPCTGDP * gdpUSD) %>%
+  select(date, "Size of banking system") %>%
+  pivot_longer(!date, names_to = "symbol", values_to = "value") %>%
+  rowwise() %>%
+  mutate(value = if (value >= 1000000000000) {
+      str_glue("{format_dollars(value / 1000000000000, 1)} trillion")
+    } else if (value < 1000000000000) {
+      str_glue("{format_dollars(value / 1000000000, 1)} billion")
+    }, 
+    valueAndDate   = str_glue("{value} in {year(date)}")) %>%
+  select(symbol, valueAndDate)
+  },
+error = function(cond) { #error catching##if there's an error, do this
+  emptyTableConcepts = list(
+    list(
+    code       = "fakeCode",
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate,
+    formatType = "none",
+    name       = "Size of banking system" #one day these names would live in a table on Github and autopopulate
+    )
+  )
+  
+  emptyTable = Map(createEmptyTable, emptyTableConcepts) %>%
+  rbindlist()
+    return(emptyTable)
+  }
+) # end of tryCatch
+##-----------viz----------------------------------------------------------------
+htmltools_value((createFlexTable(finalOutputTable))) %>%
+  div(style = "margin-top: -45px")
+})
+```
+
+```{r SizeBankingPCT, echo=FALSE, warning=FALSE}
+#start of code chunks
+renderUI({
+##-----------parameters---------------------------------------------------------
+countryName = input$countryCode
+startDate   = as.Date(input$startDate)
+endDate     = as.Date(input$endDate)
+
+countryToUse = as.character(countryLookup(countryName))
+
+concepts = list(
+  list(
+    code       = sizeBankingPctGDPCode,
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate,
+    formatType = "toPCT",
+    name       = "Size of banking system as a % of GDP" #one day these names would live in a table on Github and autopopulate
+  )
+)
+conceptsToUse = list.filter(concepts, code != "") #to temporarily remove a concept just change code to ""
+
+finalTableOutput = tryCatch(
+  {
+##-----------load data----------------------------------------------------------
+dataList = Map(getData, conceptsToUse) #applies getData to each item in conceptsToUse
+##-----------do logic-----------------------------------------------------------
+outputData = Map(function(x) x$formattedOutput, dataList) %>%
+  rbindlist() #outputs the formatted data. good if straight data pull
+  },
+error = function(cond) { #error catching##if there's an error, do this
+  emptyTable = Map(createEmptyTable, conceptsToUse) %>%
+  rbindlist()
+    return(emptyTable)
+  }
+) # end of tryCatch
+##-----------viz----------------------------------------------------------------
+htmltools_value((createFlexTable(finalTableOutput))) %>%
+  div(style = "margin-top: -45px")
+
+})
+```
+
+```{r SizeBanking/NonBanking, echo=FALSE, warning=FALSE}
+##calculated using formula: banking system %GDP / (banking system %GDP + nonbank fin institution %GDP)
+renderUI({
+##-----------parameters---------------------------------------------------------
+countryName = input$countryCode
+startDate   = as.Date(input$startDate)
+endDate     = as.Date(input$endDate)
+countryToUse = as.character(countryLookup(countryName))
+concepts = list(
+  list(
+    code       = sizeBankingPctGDPCode,
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate,
+    formatType = "none",
+    name       = "sizeBankingPCTGDP" #one day these names would live in a table on Github and autopopulate
+  ),
+  list(
+    code       = sizeNonBankFinPCTGDPCode,
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate,
+    formatType = "none",
+    name       = "sizeNonBankingPCTGDP" #one day these names would live in a table on Github and autopopulate
+  )
+)
+conceptsToUse = list.filter(concepts, code != "") #to temporarily remove a concept just change code to “”
+
+finalOutputTable = tryCatch(
+  {
+##-----------load data----------------------------------------------------------
+dataList = Map(getData, conceptsToUse) #applies getData to each item in conceptsToUse
+##-----------do logic-----------------------------------------------------------
+tidyData = Map(function(x) x$data, dataList) %>%
+  rbindlist()
+
+wideData = tidyData %>%
+  pivot_wider(names_from = symbol, values_from = value) %>%
+  mutate("Size of banking system as a % of financial system" = (sizeBankingPCTGDP/ (sizeNonBankingPCTGDP + sizeBankingPCTGDP))*100) %>%
+  select(date, "Size of banking system as a % of financial system") %>%
+  pivot_longer(!date, names_to = "symbol", values_to = "value") %>%
+  rowwise() %>%
+  mutate(formattedValue = if_else(value == "NA" || is.na(value), "Data not available", as.character(str_glue("{round(value, 1)}%"))),
+      valueAndDate   = str_glue("{formattedValue} in {year(date)}")) %>%
+  select(symbol, valueAndDate)
+  },
+error = function(cond) { #error catching##if there's an error, do this
+  emptyTableConcepts = list(
+    list(
+    code       = "fakeCode",
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate,
+    formatType = "none",
+    name       = "Size of banking system as a % of financial system" #one day these names would live in a table on Github and autopopulate
+    )
+  )
+  
+  emptyTable = Map(createEmptyTable, emptyTableConcepts) %>%
+  rbindlist()
+    return(emptyTable)
+  }
+) # end of tryCatch
+
+##-----------viz----------------------------------------------------------------
+htmltools_value((createFlexTable(finalOutputTable))) %>%
+  div(style = "margin-top: -45px")
+})
+```
+
+```{r FiveBank, echo=FALSE, warning=FALSE}
+##start of code chunks
+renderUI({
+##-----------parameters---------------------------------------------------------
+countryName = input$countryCode
+startDate   = as.Date(input$startDate)
+endDate     = as.Date(input$endDate)
+
+countryToUse = as.character(countryLookup(countryName))
+
+concepts = list(
+  list(
+    code       = fiveBankConcCode,
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate,
+    formatType = "toPCT",
+    name       = "Five-bank concentration of banking system" #one day these names would live in a table on Github and autopopulate
+  )
+)
+conceptsToUse = list.filter(concepts, code != "") #to temporarily remove a concept just change code to ""
+
+finalTableOutput = tryCatch(
+  {
+##-----------load data----------------------------------------------------------
+dataList = Map(getData, conceptsToUse) #applies getData to each item in conceptsToUse
+##-----------do logic-----------------------------------------------------------
+outputData = Map(function(x) x$formattedOutput, dataList) %>%
+  rbindlist() #outputs the formatted data. good if straight data pull
+  },
+error = function(cond) { #error catching##if there's an error, do this
+  emptyTable = Map(createEmptyTable, conceptsToUse) %>%
+  rbindlist()
+    return(emptyTable)
+  }
+) # end of tryCatch
+##-----------viz----------------------------------------------------------------
+htmltools_value((createFlexTable(finalTableOutput))) %>%
+  div(style = "margin-top: -45px")
+
+})
+
+```
+
+```{r ForInvolve, echo=FALSE, warning=FALSE}
+##start of code chunks
+renderUI({
+##-----------parameters---------------------------------------------------------
+countryName = input$countryCode
+startDate   = as.Date(input$startDate)
+endDate     = as.Date(input$endDate)
+
+countryToUse = as.character(countryLookup(countryName))
+
+concepts = list(
+  list(
+    code       = forInvolveBankCode,
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate,
+    formatType = "toPCT",
+    name       = "Foreign involvement in banking system" #one day these names would live in a table on Github and autopopulate
+  )
+)
+conceptsToUse = list.filter(concepts, code != "") #to temporarily remove a concept just change code to ""
+
+finalTableOutput = tryCatch(
+  {
+##-----------load data----------------------------------------------------------
+dataList = Map(getData, conceptsToUse) #applies getData to each item in conceptsToUse
+##-----------do logic-----------------------------------------------------------
+outputData = Map(function(x) x$formattedOutput, dataList) %>%
+  rbindlist() #outputs the formatted data. good if straight data pull
+  },
+error = function(cond) { #error catching##if there's an error, do this
+  emptyTable = Map(createEmptyTable, conceptsToUse) %>%
+  rbindlist()
+    return(emptyTable)
+  }
+) # end of tryCatch
+##-----------viz----------------------------------------------------------------
+htmltools_value((createFlexTable(finalTableOutput))) %>%
+  div(style = "margin-top: -45px")
+
+})
+
+```
+
+```{r Deposit Insurance, echo=FALSE, warning=FALSE}
+##start of code chunks
+renderUI({
+##-----------parameters---------------------------------------------------------
+countryName = input$countryCode
+startDate   = as.Date(input$startDate)
+endDate     = as.Date(input$endDate)
+
+countryToUse = as.character(countryLookup(countryName))
+
+concepts = list(
+  list(
+    code       = "depositInsurance",
+    country    = countryToUse,
+    startDate  = startDate,
+    endDate    = endDate,
+    formatType = "depositInsurance",
+    name       = "Existence of deposit insurance" #one day these names would live in a table on Github and autopopulate
+  )
+)
+conceptsToUse = list.filter(concepts, code != "") #to temporarily remove a concept just change code to ""
+
+finalTableOutput = tryCatch(
+  {
+##-----------load data----------------------------------------------------------
+dataList = Map(getData, conceptsToUse) #applies getData to each item in conceptsToUse
+##-----------do logic-----------------------------------------------------------
+outputData = Map(function(x) x$formattedOutput, dataList) %>%
+  rbindlist() #outputs the formatted data. good if straight data pull
+  },
+error = function(cond) { #error catching##if there's an error, do this
+  emptyTable = Map(createEmptyTable, conceptsToUse) %>%
+  rbindlist()
+    return(emptyTable)
+  }
+) # end of tryCatch
+##-----------viz----------------------------------------------------------------
+htmltools_value((createFlexTable(finalTableOutput))) %>%
+  div(style = "margin-top: -45px")
+})
+```
+
+```{r Footer, warning=FALSE}
+##this is just rendering the header
+renderUI({
+##-----------do logic-----------------------------------------------------------
+footerText = as.character(str_glue("Sources: Bloomberg; World Bank Global Financial Development Database; World Bank Deposit Insurance Dataset."))
+outputData = as.data.frame(footerText)
+
+##-----------viz----------------------------------------------------------------
+flextable(outputData) %>% #uses different formatting than the rest of the chunks
+    delete_part() %>%
+    border_inner() %>%
+    border_outer() %>%
+    width(width = 8.001, unit = "in") %>%
+    height(height = .2, unit = "in") %>% 
+    hrule(rule = "exact") %>%
+    align(align = "center") %>% 
+    italic(italic = TRUE) %>% 
+    font(fontname = "Serif Cambria") %>%
+    htmltools_value() %>%
+  div(style = "margin-top: -45px")
+
+})
+```
